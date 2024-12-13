@@ -35,7 +35,7 @@ class Worker(QThread):
             if not os.path.exists(self.file_path):
                 raise FileNotFoundError("所选文件不存在")
 
-            valid_extensions = {'.mp3', '.wav', '.mp4', '.mkv'}
+            valid_extensions = {'.mp3', '.wav', '.mp4', '.mkv', '.mov'}
             if not Path(self.file_path).suffix.lower() in valid_extensions:
                 raise ValueError("不支持的文件格式")
 
