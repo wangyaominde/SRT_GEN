@@ -1,0 +1,43 @@
+name: Build SRT_gen
+
+on:
+  push:
+    branches:
+      - main  # 当推送到 main 分支时触发
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # 设置 Python 环境
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'  # 可根据需要更改 Python 版本
+
+      # 安装依赖
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 使用 PyInstaller 编译为 EXE 文件
+      - name: Build EXE
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --name SRT_gen main.py
+
+      # 将生成的 EXE 文件保存为 Artifact
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: SRT_gen
+          path: dist/SRT_gen.exe
