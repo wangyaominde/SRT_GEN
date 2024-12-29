@@ -34,7 +34,7 @@ jobs:
         with:
           files: dist/SRT_gen.exe
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
   build-macos:
     runs-on: macos-latest
@@ -63,4 +63,4 @@ jobs:
         with:
           files: dist/SRT_gen  # 无后缀
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
