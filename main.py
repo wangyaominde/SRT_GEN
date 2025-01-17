@@ -1,13 +1,26 @@
 import sys
-import whisper
 import os
 import shutil
+import platform
 from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QPushButton, QWidget, QComboBox, QProgressBar
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from pathlib import Path
 import time
 import subprocess
 import json
+
+# 检查是否为 Apple Silicon Mac
+def is_apple_silicon():
+    return (platform.system() == "Darwin" and 
+            platform.machine() == "arm64")
+
+# 根据系统环境导入相应的whisper实现
+if is_apple_silicon():
+    import mlx_whisper
+    print("使用 MLX Whisper (Apple Silicon 优化版本)")
+else:
+    import whisper
+    print("使用标准 Whisper")
 
 class Worker(QThread):
     result = pyqtSignal(object)
@@ -45,24 +58,34 @@ class Worker(QThread):
                 raise ValueError(f"文件时长太短（{duration:.1f}秒），最少需要10秒")
 
             # 加载模型
-            model_path = os.path.expanduser(f"~/.cache/whisper/{self.model_size}.pt")
-            if not os.path.exists(model_path):
-                self.started_task.emit("downloading")
-                self.progress.emit(f"正在下载 {self.model_size} 模型，首次使用需要较长时间...")
-            else:
+            if is_apple_silicon():
                 self.started_task.emit("loading")
                 self.progress.emit("正在加载模型...")
-            
-            model = whisper.load_model(self.model_size, device=self.device)
-            
-            self.started_task.emit("transcribing")
-            self.progress.emit("正在转录音频，请耐心等待...")
-
-            result = model.transcribe(
-                self.file_path,
-                language='zh',
-                verbose=False
-            )
+                # 使用 MLX 优化的模型
+                model_name = f"mlx-community/whisper-{self.model_size}-mlx"
+                result = mlx_whisper.transcribe(
+                    self.file_path,
+                    path_or_hf_repo=model_name,
+                    language='zh'
+                )
+            else:
+                model_path = os.path.expanduser(f"~/.cache/whisper/{self.model_size}.pt")
+                if not os.path.exists(model_path):
+                    self.started_task.emit("downloading")
+                    self.progress.emit(f"正在下载 {self.model_size} 模型，首次使用需要较长时间...")
+                else:
+                    self.started_task.emit("loading")
+                    self.progress.emit("正在加载模型...")
+                model = whisper.load_model(self.model_size, device=self.device)
+                
+                self.started_task.emit("transcribing")
+                self.progress.emit("正在转录音频，请耐心等待...")
+                
+                result = model.transcribe(
+                    self.file_path,
+                    language='zh',
+                    verbose=False
+                )
             
             if not result or 'segments' not in result:
                 raise ValueError("转录失败，未能生成有效的分段数据")
@@ -117,11 +140,13 @@ class SubtitleGenerator(QMainWindow):
         
         self.model_selector = QComboBox(self)
         models = [
-            ("tiny", "最小 (速度最快，准确度最低)"),
-            ("base", "基础 (较快，准确度一般)"),
-            ("small", "小型 (平衡速度和准确度)"),
-            ("medium", "中型 (较慢，准确度较高)"),
-            ("large", "大型 (最慢，准确度最高)")
+            ("large-v3", "大型V3 (最新，准确度最高)"),
+            ("large-v2", "大型V2"),
+            ("large", "大型"),
+            ("medium", "中型"),
+            ("small", "小型"),
+            ("base", "基础"),
+            ("tiny", "最小")
         ]
         for model_id, model_desc in models:
             self.model_selector.addItem(model_desc, model_id)
@@ -132,9 +157,13 @@ class SubtitleGenerator(QMainWindow):
         layout.addWidget(device_label)
         
         self.device_selector = QComboBox(self)
-        if self.check_cuda():
-            self.device_selector.addItem("CUDA (GPU加速)", "cuda")
-        self.device_selector.addItem("CPU", "cpu")
+        if not is_apple_silicon():  # 只在非 Apple Silicon 设备上显示设备选择
+            if self.check_cuda():
+                self.device_selector.addItem("CUDA (GPU加速)", "cuda")
+            self.device_selector.addItem("CPU", "cpu")
+        else:
+            self.device_selector.addItem("MLX (Apple Silicon)", "mlx")
+            self.device_selector.setEnabled(False)  # 在 Apple Silicon 上禁用设备选择
         layout.addWidget(self.device_selector)
 
         # 生成按钮
@@ -207,7 +236,7 @@ class SubtitleGenerator(QMainWindow):
             self,
             '选择文件',
             '',
-            '支持的文件 (*.mp3 *.wav *.mp4 *.mkv);;所有文件 (*.*)',
+            '支持的文件 (*.mp3 *.wav *.mp4 *.mkv *.mov);;音频文件 (*.mp3 *.wav);;视频文件 (*.mp4 *.mkv *.mov);;所有文件 (*.*)',
             options=options
         )
         if file_name:

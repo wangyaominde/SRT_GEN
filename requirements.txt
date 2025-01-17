@@ -1,4 +1,6 @@
 openai_whisper==20240930
+mlx_whisper==0.0.6
 PyQt5==5.15.11
 PyQt5_sip==12.15.0
-torch==2.5.1
+torch==2.2.1
+platform-utils==0.1.0
