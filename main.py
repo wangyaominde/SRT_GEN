@@ -9,6 +9,19 @@ import time
 import subprocess
 import json
 
+# 支持的音频与视频扩展名（基于 ffmpeg 常见可解码格式）
+SUPPORTED_AUDIO_EXTENSIONS = {
+    '.aac', '.aiff', '.alac', '.amr', '.flac', '.m4a', '.mp3',
+    '.ogg', '.opus', '.wav', '.wma'
+}
+
+SUPPORTED_VIDEO_EXTENSIONS = {
+    '.avi', '.flv', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg',
+    '.mpg', '.ts', '.webm', '.wmv'
+}
+
+SUPPORTED_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS.union(SUPPORTED_VIDEO_EXTENSIONS)
+
 # 检查是否为 Apple Silicon Mac
 def is_apple_silicon():
     return (platform.system() == "Darwin" and 
@@ -34,23 +47,69 @@ class Worker(QThread):
         self.device = device
 
     def get_audio_duration(self):
+        """通过 ffprobe 获取文件总时长，用于过滤过短文件。
+
+        Args:
+            无。
+
+        Returns:
+            float: 音频/音视频总时长（秒）。
+
+        Raises:
+            ValueError: ffprobe 执行失败或返回数据无法解析。
+
+        Side effects:
+            无。
+        """
         try:
             cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', 
                   '-of', 'json', self.file_path]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise ValueError(f"ffprobe 执行失败: {result.stderr.strip() or '未知错误'}")
             data = json.loads(result.stdout)
             return float(data['format']['duration'])
         except Exception as e:
             raise ValueError(f"无法获取文件时长: {str(e)}")
 
+    def is_supported_file(self):
+        """判断输入文件是否是支持的音频或视频格式。
+
+        Args:
+            无。
+
+        Returns:
+            bool: 后缀名在白名单中返回 True。
+
+        Raises:
+            无。
+
+        Side effects:
+            无。
+        """
+        return Path(self.file_path).suffix.lower() in SUPPORTED_EXTENSIONS
+
     def run(self):
+        """在线程中完成模型加载与转录流程。
+
+        Args:
+            无。
+
+        Returns:
+            无。成功时通过 `result` 信号返回 `segments`，失败时返回错误字符串。
+
+        Raises:
+            无（统一转换为字符串信号）。
+
+        Side effects:
+            调用 whisper/mlx_whisper 进行转录，可能在首次运行时下载模型。
+        """
         try:
             if not os.path.exists(self.file_path):
                 raise FileNotFoundError("所选文件不存在")
 
-            valid_extensions = {'.mp3', '.wav', '.mp4', '.mkv', '.mov'}
-            if not Path(self.file_path).suffix.lower() in valid_extensions:
-                raise ValueError("不支持的文件格式")
+            if not self.is_supported_file():
+                raise ValueError("不支持的文件格式，请选择常见音频/视频文件")
 
             # 检查文件时长
             duration = self.get_audio_duration()
@@ -209,7 +268,7 @@ class SubtitleGenerator(QMainWindow):
         }
         
         if self.current_task in task_messages:
-            self.label.setText(task_messages[self.current_task])
+            self.time_label.setText(task_messages[self.current_task])
 
     def check_cuda(self):
         try:
@@ -232,11 +291,13 @@ class SubtitleGenerator(QMainWindow):
 
     def open_file_dialog(self):
         options = QFileDialog.Options()
+        audio_filter = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_AUDIO_EXTENSIONS))
+        video_filter = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_VIDEO_EXTENSIONS))
         file_name, _ = QFileDialog.getOpenFileName(
             self,
             '选择文件',
             '',
-            '支持的文件 (*.mp3 *.wav *.mp4 *.mkv *.mov);;音频文件 (*.mp3 *.wav);;视频文件 (*.mp4 *.mkv *.mov);;所有文件 (*.*)',
+            f'支持的文件 ({audio_filter} {video_filter});;音频文件 ({audio_filter});;视频文件 ({video_filter});;所有文件 (*.*)',
             options=options
         )
         if file_name:
@@ -249,7 +310,7 @@ class SubtitleGenerator(QMainWindow):
             return
 
         if not self.check_ffmpeg():
-            self.label.setText('错误：未找到ffmpeg，请确保已安装ffmpeg并配置环境变量。')
+            self.label.setText('错误：未找到 ffmpeg 或 ffprobe，请确保已安装并配置环境变量。')
             return
 
         self.generate_button.setEnabled(False)
@@ -273,7 +334,7 @@ class SubtitleGenerator(QMainWindow):
         self.start_timer()
 
     def check_ffmpeg(self):
-        return shutil.which("ffmpeg") is not None
+        return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
     def update_progress(self, message):
         if not message.startswith("错误"):
