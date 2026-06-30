@@ -1,0 +1,194 @@
+"""带进度/速度显示的多线程（分块并行）模型下载器。
+
+对外提供：
+- parallel_download(url, dest, on_progress, connections): 通用多连接分块下载，
+  服务器不支持 Range 时自动回退单流。
+- ensure_whisper_model(size, ...): 把 openai-whisper 的 .pt 下到 ~/.cache/whisper，
+  下完交由 whisper.load_model 校验（sha 不符会自动重下）。
+- ensure_mlx_model(size, ...): 把 mlx-community/whisper-{size}-mlx 仓库文件下到本地目录，
+  返回该目录路径，供 mlx_whisper.transcribe(path_or_hf_repo=<dir>) 离线加载。
+
+设计原则：均为「优化层」，任何异常都应由调用方捕获并回退到后端自带的下载逻辑，
+绝不因下载加速失败而影响转录本身。
+"""
+import os
+import time
+import threading
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+_CHUNK = 1 << 20          # 1 MiB
+_DEFAULT_CONNECTIONS = 8
+_UA = {'User-Agent': 'SRT_gen/2.x'}
+
+
+def _probe(url, timeout=30):
+    """探测文件大小与是否支持 Range（用 bytes=0-0 单字节请求）。
+
+    返回 (total_bytes, ranges_supported)。total 为 0 表示未知。
+    """
+    req = urllib.request.Request(url, headers={**_UA, 'Range': 'bytes=0-0'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        status = getattr(r, 'status', r.getcode())
+        cr = r.headers.get('Content-Range')
+        if status == 206 and cr and '/' in cr:
+            try:
+                return int(cr.rsplit('/', 1)[1]), True
+            except ValueError:
+                pass
+        cl = r.headers.get('Content-Length')
+        return (int(cl) if cl and cl.isdigit() else 0), False
+
+
+def _split(total, parts):
+    step = total // parts
+    ranges = []
+    start = 0
+    for i in range(parts):
+        end = total - 1 if i == parts - 1 else (start + step - 1)
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
+def _single_stream(url, part_path, total, on_progress, timeout=120):
+    req = urllib.request.Request(url, headers=_UA)
+    t0 = time.time()
+    done = 0
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(part_path, 'wb') as f:
+        while True:
+            buf = r.read(_CHUNK)
+            if not buf:
+                break
+            f.write(buf)
+            done += len(buf)
+            if on_progress:
+                el = time.time() - t0
+                on_progress(done, total or done, done / el if el > 0 else 0)
+
+
+def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTIONS, timeout=120):
+    """多连接分块下载到 dest（先写 dest.part 再原子替换）。
+
+    on_progress(downloaded_bytes, total_bytes, speed_bytes_per_sec)。
+    服务器不支持 Range 或大小未知时回退为单流下载。
+    """
+    part = dest + '.part'
+    try:
+        total, ranges_ok = _probe(url, timeout=30)
+    except Exception:
+        total, ranges_ok = 0, False
+
+    if not (ranges_ok and total > _CHUNK * 2 and connections > 1):
+        _single_stream(url, part, total, on_progress, timeout=timeout)
+        os.replace(part, dest)
+        return dest
+
+    # 预分配文件，多线程各写一段（区间不重叠，分别打开句柄安全）
+    with open(part, 'wb') as f:
+        f.truncate(total)
+
+    lock = threading.Lock()
+    state = {'done': 0, 't0': time.time()}
+
+    def worker(start, end):
+        req = urllib.request.Request(url, headers={**_UA, 'Range': f'bytes={start}-{end}'})
+        with urllib.request.urlopen(req, timeout=timeout) as r, open(part, 'r+b') as f:
+            f.seek(start)
+            while True:
+                buf = r.read(_CHUNK)
+                if not buf:
+                    break
+                f.write(buf)
+                if on_progress:
+                    with lock:
+                        state['done'] += len(buf)
+                        el = time.time() - state['t0']
+                        on_progress(state['done'], total, state['done'] / el if el > 0 else 0)
+
+    try:
+        with ThreadPoolExecutor(max_workers=connections) as ex:
+            futures = [ex.submit(worker, s, e) for s, e in _split(total, connections)]
+            for fu in futures:
+                fu.result()  # 任一分块失败则抛出
+    except Exception:
+        # 并行失败 → 清理后回退单流，保证尽量能下完
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        _single_stream(url, part, total, on_progress, timeout=timeout)
+
+    os.replace(part, dest)
+    return dest
+
+
+def ensure_whisper_model(size, on_progress=None, on_start=None,
+                         connections=_DEFAULT_CONNECTIONS):
+    """确保 openai-whisper 的 {size}.pt 已在 ~/.cache/whisper。
+
+    已存在则直接返回（由 whisper.load_model 负责 sha 校验/必要时重下）。
+    返回 .pt 路径；无法处理（未知模型名）时返回 None 让后端自行下载。
+    """
+    import whisper
+    models = getattr(whisper, '_MODELS', {})
+    if size not in models:
+        return None
+    url = models[size]
+    root = os.path.expanduser('~/.cache/whisper')
+    dest = os.path.join(root, os.path.basename(url))
+    if os.path.exists(dest):
+        return dest
+    os.makedirs(root, exist_ok=True)
+    if on_start:
+        on_start()
+    parallel_download(url, dest, on_progress=on_progress, connections=connections)
+    return dest
+
+
+def ensure_mlx_model(size, on_progress=None, on_start=None,
+                     connections=_DEFAULT_CONNECTIONS):
+    """确保 mlx-community/whisper-{size}-mlx 仓库文件已下到本地目录。
+
+    返回本地目录路径（含 config.json + weights.npz 等），供 mlx_whisper
+    离线加载。任何失败应由调用方捕获并回退到传 repo id。
+    """
+    from huggingface_hub import HfApi, hf_hub_url
+
+    repo = f'mlx-community/whisper-{size}-mlx'
+    target_dir = os.path.join(os.path.expanduser('~/.cache/srtgen_models'),
+                              f'whisper-{size}-mlx')
+
+    info = HfApi().model_info(repo, files_metadata=True)
+    sibs = [(s.rfilename, int(getattr(s, 'size', 0) or 0)) for s in info.siblings]
+
+    def ok(fn, sz):
+        p = os.path.join(target_dir, fn)
+        return os.path.exists(p) and (sz == 0 or os.path.getsize(p) == sz)
+
+    if sibs and all(ok(fn, sz) for fn, sz in sibs):
+        return target_dir  # 已缓存
+
+    total = sum(sz for _, sz in sibs) or 0
+    if on_start:
+        on_start()
+
+    base = 0
+    for fn, sz in sibs:
+        dest = os.path.join(target_dir, fn)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if ok(fn, sz):
+            base += sz
+            continue
+        url = hf_hub_url(repo, fn)
+        b0 = base
+
+        def cb(done, _t, speed, _b0=b0):
+            if on_progress:
+                on_progress(_b0 + done, total or (_b0 + done), speed)
+
+        parallel_download(url, dest, on_progress=cb if on_progress else None,
+                          connections=connections)
+        base += sz
+
+    return target_dir

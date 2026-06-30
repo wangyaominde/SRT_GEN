@@ -12,7 +12,9 @@
 - 运行设备选择（Apple Silicon 自动用 MLX；其余平台 CPU / CUDA）
 - 生成标准 `.srt`，并可选同时导出 Apple `.itt`
 - **ffmpeg 已随包内置**，下载安装即用，无需另行安装
+- **多线程加速下载模型**，实时显示进度百分比与速度（MB/s）
 - 模型缓存：批量处理时只加载一次模型
+- 支持拖拽音视频文件到窗口（多文件）
 
 > 命令行批量转 ITT：`python srt2itt.py a.srt b.srt`
 
@@ -39,12 +41,12 @@ xattr -cr /路径/SRT_gen.app
 
 ### 关于模型下载
 
-模型**不随包封装**（`large` 系列单个就有约 3GB，超过 GitHub 单文件上限），首次选用某个模型时会自动下载并缓存：
+模型**不随包封装**（`large` 系列单个就有约 3GB，超过 GitHub 单文件上限），首次选用某个模型时会**多线程并行下载并显示进度/速度**，之后缓存复用：
 
-- Apple Silicon：缓存于 `~/.cache/huggingface`
+- Apple Silicon：缓存于 `~/.cache/srtgen_models`（下载失败时回退到后端默认的 `~/.cache/huggingface`）
 - 其余平台：缓存于 `~/.cache/whisper`
 
-首次使用大模型耗时取决于网络。
+首次使用大模型耗时取决于网络；多线程分块下载会尽量跑满带宽。
 
 ---
 

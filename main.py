@@ -25,6 +25,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon
 
 import srt2itt
+import downloader
 
 # 支持的音频与视频扩展名（基于 ffmpeg 常见可解码格式）
 SUPPORTED_AUDIO_EXTENSIONS = {
@@ -199,16 +200,6 @@ def _get_whisper_model(whisper, size, device):
     return model
 
 
-def _whisper_pt_cached(size):
-    return os.path.exists(os.path.expanduser(f'~/.cache/whisper/{size}.pt'))
-
-
-def _mlx_repo_cached(size):
-    repo = f'models--mlx-community--whisper-{size}-mlx'
-    hub = os.path.expanduser('~/.cache/huggingface/hub')
-    return os.path.isdir(os.path.join(hub, repo))
-
-
 # ----------------------------- SRT 生成 -----------------------------
 
 def format_timestamp(seconds):
@@ -253,16 +244,38 @@ class Worker(QThread):
     def _emit_pct(self, fraction):
         self.progress_pct.emit(int(fraction * 100))
 
+    def _on_download_start(self):
+        self.started_task.emit('downloading')
+
+    def _on_download_progress(self, done, total, speed):
+        """下载进度回调（节流到约 5 次/秒），显示百分比 + 速度 + 大小。"""
+        now = time.time()
+        if now - getattr(self, '_last_dl_emit', 0) < 0.2 and total and done < total:
+            return
+        self._last_dl_emit = now
+        mb = 1 << 20
+        pct = int(done / total * 100) if total else 0
+        self.progress_pct.emit(pct)
+        self.progress.emit(
+            f'下载模型 {pct}% · {speed / mb:.1f} MB/s · {done // mb}/{(total or done) // mb} MB')
+
     def _transcribe_one(self, backend, path, apple, model_holder):
         """转录单个文件，返回 whisper 风格 result dict。"""
         if apple:
+            # 多线程下载模型（带进度/速度），失败回退到传 repo id 让后端自行下载
             repo = f'mlx-community/whisper-{self.model_size}-mlx'
-            if not _mlx_repo_cached(self.model_size):
-                self.started_task.emit('downloading')
-                self.progress.emit(f'首次使用，正在下载 {self.model_size} 模型并转录（较慢）...')
-            else:
-                self.started_task.emit('transcribing')
-                self.progress.emit('正在转录...')
+            try:
+                local = downloader.ensure_mlx_model(
+                    self.model_size,
+                    on_progress=self._on_download_progress,
+                    on_start=self._on_download_start)
+                if local:
+                    repo = local
+            except Exception:
+                repo = f'mlx-community/whisper-{self.model_size}-mlx'
+            self.started_task.emit('transcribing')
+            self.progress.emit('正在转录...')
+            self.progress_pct.emit(0)
             restore = _install_progress_patch('mlx_whisper')
             _ProgressReporter.callback = self._emit_pct
             try:
@@ -278,15 +291,19 @@ class Worker(QThread):
                 restore()
         else:
             if model_holder.get('model') is None:
-                if _whisper_pt_cached(self.model_size):
-                    self.started_task.emit('loading')
-                    self.progress.emit('正在加载模型...')
-                else:
-                    self.started_task.emit('downloading')
-                    self.progress.emit(f'正在下载 {self.model_size} 模型（首次使用较慢）...')
+                try:
+                    downloader.ensure_whisper_model(
+                        self.model_size,
+                        on_progress=self._on_download_progress,
+                        on_start=self._on_download_start)
+                except Exception:
+                    pass  # 回退到 whisper.load_model 自带下载
+                self.started_task.emit('loading')
+                self.progress.emit('正在加载模型...')
                 model_holder['model'] = _get_whisper_model(backend, self.model_size, self.device)
             self.started_task.emit('transcribing')
             self.progress.emit('正在转录...')
+            self.progress_pct.emit(0)
             restore = _install_progress_patch('whisper')
             _ProgressReporter.callback = self._emit_pct
             try:
@@ -473,10 +490,12 @@ class SubtitleGenerator(QMainWindow):
             event.ignore()
 
     def dropEvent(self, event):
-        paths = [u.toLocalFile() for u in event.mimeData().urls()]
-        paths = [p for p in paths if Path(p).suffix.lower() in SUPPORTED_EXTENSIONS]
-        if paths:
-            self.set_files(paths)
+        all_paths = [u.toLocalFile() for u in event.mimeData().urls()]
+        supported = [p for p in all_paths if Path(p).suffix.lower() in SUPPORTED_EXTENSIONS]
+        if supported:
+            self.set_files(supported)
+        elif all_paths:
+            self.label.setText('拖入的文件格式不受支持，请拖入音频/视频文件')
 
     def open_file_dialog(self):
         audio_filter = ' '.join(f'*{ext}' for ext in sorted(SUPPORTED_AUDIO_EXTENSIONS))
@@ -623,6 +642,15 @@ def selftest():
     except Exception as e:
         ok = False
         print(f'[selftest] FAIL: tokenizer 失败 {e!r}')
+
+    # 下载器模块（确保随包）
+    try:
+        import downloader as _dl
+        assert hasattr(_dl, 'parallel_download')
+        print('[selftest] downloader OK')
+    except Exception as e:
+        ok = False
+        print(f'[selftest] FAIL: downloader {e!r}')
 
     # MLX Metal 内核：强制一次 GPU 计算以加载 mlx.metallib（验证其已打包）
     if is_apple_silicon():
