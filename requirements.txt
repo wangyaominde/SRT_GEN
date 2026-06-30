@@ -1,5 +1,14 @@
-openai_whisper==20250625
-mlx_whisper==0.4.3
+# ---- 通用依赖（所有平台） ----
 PyQt5==5.15.11
 PyQt5_sip==12.15.0
-torch==2.2.1
+imageio-ffmpeg==0.6.0          # 自带 ffmpeg 二进制，随包分发，开箱即用
+
+# ---- Apple Silicon（macOS arm64）：MLX 优化路径 ----
+# mlx_whisper 会自动带入 mlx / torch / numba / tiktoken / huggingface_hub 等依赖
+mlx_whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'
+
+# ---- 其余平台（Windows / Linux / Intel Mac）：openai-whisper + torch ----
+# PEP 508 没有一元 not，用 De Morgan 表达「非(darwin 且 arm64)」
+openai-whisper==20250625; sys_platform != 'darwin' or platform_machine != 'arm64'
+torch==2.2.1; sys_platform != 'darwin' or platform_machine != 'arm64'
+numpy<2; sys_platform != 'darwin' or platform_machine != 'arm64'   # torch 2.2.1 不兼容 numpy 2.x

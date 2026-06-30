@@ -6,61 +6,91 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          PIP_NO_BUILD_ISOLATION=1 pip install -r requirements.txt
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
 
-      - name: Build EXE
-        run: |
-          pip install pyinstaller
-          pyinstaller --onefile --name SRT_gen main.py
+      - name: Build (onedir, .exe)
+        run: pyinstaller SRT_gen.spec --noconfirm --clean
 
-      - name: Create Release and Upload
-        uses: softprops/action-gh-release@v1
+      - name: Smoke test (frozen binary)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: dist/SRT_gen/SRT_gen.exe --selftest
+
+      - name: Package zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/SRT_gen -DestinationPath SRT_gen-windows-x64.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/SRT_gen.exe
+          name: SRT_gen-windows-x64
+          path: SRT_gen-windows-x64.zip
+
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SRT_gen-windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-macos:
-    runs-on: macos-latest
-
+    runs-on: macos-latest          # Apple Silicon (arm64)
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          PIP_NO_BUILD_ISOLATION=1 pip install -r requirements.txt
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
 
-      - name: Build Binary
-        run: |
-          pip install pyinstaller
-          pyinstaller --onefile --name SRT_gen main.py
+      - name: Build (.app)
+        run: pyinstaller SRT_gen.spec --noconfirm --clean
 
-      - name: Create Release and Upload
-        uses: softprops/action-gh-release@v1
+      - name: Smoke test (frozen .app)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ./dist/SRT_gen.app/Contents/MacOS/SRT_gen --selftest
+
+      - name: Package zip (ditto preserves bundle + exec bit)
+        run: ditto -c -k --keepParent dist/SRT_gen.app SRT_gen-macos-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/SRT_gen  # 无后缀
+          name: SRT_gen-macos-arm64
+          path: SRT_gen-macos-arm64.zip
+
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SRT_gen-macos-arm64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
