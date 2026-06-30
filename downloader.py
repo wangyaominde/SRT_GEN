@@ -19,25 +19,33 @@ from concurrent.futures import ThreadPoolExecutor
 
 _CHUNK = 1 << 20          # 1 MiB
 _DEFAULT_CONNECTIONS = 8
+_TIMEOUT = 45             # 单次读/连接超时（秒）：超过即判定卡住并续传重试
+_RETRIES = 6             # 每个分块连续「无进展」重试上限
 _UA = {'User-Agent': 'SRT_gen/2.x'}
 
 
-def _probe(url, timeout=30):
-    """探测文件大小与是否支持 Range（用 bytes=0-0 单字节请求）。
+def _resolve(url, timeout=_TIMEOUT):
+    """探测大小与是否支持 Range（用 bytes=0-0 单字节请求）。
 
-    返回 (total_bytes, ranges_supported)。total 为 0 表示未知。
+    返回 (total_bytes, ranges_supported)；total 为 0 表示未知。
+    注意：不复用重定向后的 CDN URL —— HuggingFace 的 resolve 会重定向到带签名、
+    短时效的 CDN 链接，复用到多个分块请求上会失败；每个分块需各自请求原始 URL，
+    由 urllib 每次重新重定向。
     """
-    req = urllib.request.Request(url, headers={**_UA, 'Range': 'bytes=0-0'})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        status = getattr(r, 'status', r.getcode())
-        cr = r.headers.get('Content-Range')
-        if status == 206 and cr and '/' in cr:
-            try:
-                return int(cr.rsplit('/', 1)[1]), True
-            except ValueError:
-                pass
-        cl = r.headers.get('Content-Length')
-        return (int(cl) if cl and cl.isdigit() else 0), False
+    try:
+        req = urllib.request.Request(url, headers={**_UA, 'Range': 'bytes=0-0'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            status = getattr(r, 'status', r.getcode())
+            cr = r.headers.get('Content-Range')
+            if status == 206 and cr and '/' in cr:
+                try:
+                    return int(cr.rsplit('/', 1)[1]), True
+                except ValueError:
+                    pass
+            cl = r.headers.get('Content-Length')
+            return (int(cl) if cl and cl.isdigit() else 0), False
+    except Exception:
+        return 0, False
 
 
 def _split(total, parts):
@@ -51,36 +59,50 @@ def _split(total, parts):
     return ranges
 
 
-def _single_stream(url, part_path, total, on_progress, timeout=120):
-    req = urllib.request.Request(url, headers=_UA)
-    t0 = time.time()
-    done = 0
-    with urllib.request.urlopen(req, timeout=timeout) as r, open(part_path, 'wb') as f:
-        while True:
-            buf = r.read(_CHUNK)
-            if not buf:
-                break
-            f.write(buf)
-            done += len(buf)
-            if on_progress:
-                el = time.time() - t0
-                on_progress(done, total or done, done / el if el > 0 else 0)
+def _single_stream(url, part_path, total, on_progress, timeout=_TIMEOUT, retries=_RETRIES):
+    """单流下载（服务器不支持 Range）。卡住/失败则重试（从头）。"""
+    attempt = 0
+    while True:
+        try:
+            t0 = time.time()
+            done = 0
+            req = urllib.request.Request(url, headers=_UA)
+            with urllib.request.urlopen(req, timeout=timeout) as r, open(part_path, 'wb') as f:
+                while True:
+                    buf = r.read(_CHUNK)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    done += len(buf)
+                    if on_progress:
+                        el = time.time() - t0
+                        on_progress(done, total or done, done / el if el > 0 else 0)
+            return
+        except Exception:
+            attempt += 1
+            if attempt > retries:
+                raise
+            time.sleep(min(2 * attempt, 8))
 
 
-def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTIONS, timeout=120):
+def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTIONS,
+                      timeout=_TIMEOUT, retries=_RETRIES):
     """多连接分块下载到 dest（先写 dest.part 再原子替换）。
+
+    抗卡住设计：
+    - 先解析一次最终 URL，避免每个分块重复重定向/限流；
+    - 每个分块独立「断点续传 + 重试」：连接中断或读卡住（超过 timeout 无数据）后，
+      从已写位置继续，只要仍有进展就不消耗重试次数；连续无进展超过 retries 次才放弃；
+    - 不会因单个分块失败而把已下载内容全部作废重来。
 
     on_progress(downloaded_bytes, total_bytes, speed_bytes_per_sec)。
     服务器不支持 Range 或大小未知时回退为单流下载。
     """
     part = dest + '.part'
-    try:
-        total, ranges_ok = _probe(url, timeout=30)
-    except Exception:
-        total, ranges_ok = 0, False
+    total, ranges_ok = _resolve(url, timeout=timeout)
 
     if not (ranges_ok and total > _CHUNK * 2 and connections > 1):
-        _single_stream(url, part, total, on_progress, timeout=timeout)
+        _single_stream(url, part, total, on_progress, timeout=timeout, retries=retries)
         os.replace(part, dest)
         return dest
 
@@ -91,33 +113,54 @@ def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTI
     lock = threading.Lock()
     state = {'done': 0, 't0': time.time()}
 
+    def report(delta):
+        if not on_progress:
+            return
+        with lock:
+            state['done'] += delta
+            el = time.time() - state['t0']
+            on_progress(state['done'], total, state['done'] / el if el > 0 else 0)
+
     def worker(start, end):
-        req = urllib.request.Request(url, headers={**_UA, 'Range': f'bytes={start}-{end}'})
-        with urllib.request.urlopen(req, timeout=timeout) as r, open(part, 'r+b') as f:
-            f.seek(start)
-            while True:
-                buf = r.read(_CHUNK)
-                if not buf:
-                    break
-                f.write(buf)
-                if on_progress:
-                    with lock:
-                        state['done'] += len(buf)
-                        el = time.time() - state['t0']
-                        on_progress(state['done'], total, state['done'] / el if el > 0 else 0)
+        pos = start
+        attempt = 0
+        while pos <= end:
+            before = pos
+            try:
+                req = urllib.request.Request(
+                    url, headers={**_UA, 'Range': f'bytes={pos}-{end}'})
+                with urllib.request.urlopen(req, timeout=timeout) as r, open(part, 'r+b') as f:
+                    f.seek(pos)
+                    while True:
+                        buf = r.read(_CHUNK)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        pos += len(buf)
+                        report(len(buf))
+            except Exception:
+                pass
+            if pos > end:
+                return                      # 本分块完成
+            if pos > before:
+                attempt = 0                 # 有进展 → 重置重试计数，继续续传
+            else:
+                attempt += 1
+                if attempt > retries:
+                    raise IOError(f'分块 {start}-{end} 多次重试仍无进展')
+                time.sleep(min(2 * attempt, 8))
 
     try:
         with ThreadPoolExecutor(max_workers=connections) as ex:
             futures = [ex.submit(worker, s, e) for s, e in _split(total, connections)]
             for fu in futures:
-                fu.result()  # 任一分块失败则抛出
+                fu.result()  # 任一分块彻底失败则抛出，由调用方回退到后端自带下载
     except Exception:
-        # 并行失败 → 清理后回退单流，保证尽量能下完
         try:
             os.remove(part)
         except OSError:
             pass
-        _single_stream(url, part, total, on_progress, timeout=timeout)
+        raise
 
     os.replace(part, dest)
     return dest
