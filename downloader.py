@@ -13,14 +13,15 @@
 """
 import os
 import time
+import queue
 import threading
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
-_CHUNK = 1 << 20          # 1 MiB
+_CHUNK = 1 << 20          # 1 MiB 读缓冲
+_CHUNK_SIZE = 16 << 20    # 16 MiB 任务块（队列工作窃取，抗慢尾）
 _DEFAULT_CONNECTIONS = 8
 _TIMEOUT = 45             # 单次读/连接超时（秒）：超过即判定卡住并续传重试
-_RETRIES = 6             # 每个分块连续「无进展」重试上限
+_RETRIES = 6             # 每个块连续「无进展」重试上限
 _UA = {'User-Agent': 'SRT_gen/2.x'}
 
 
@@ -46,17 +47,6 @@ def _resolve(url, timeout=_TIMEOUT):
             return (int(cl) if cl and cl.isdigit() else 0), False
     except Exception:
         return 0, False
-
-
-def _split(total, parts):
-    step = total // parts
-    ranges = []
-    start = 0
-    for i in range(parts):
-        end = total - 1 if i == parts - 1 else (start + step - 1)
-        ranges.append((start, end))
-        start = end + 1
-    return ranges
 
 
 def _single_stream(url, part_path, total, on_progress, timeout=_TIMEOUT, retries=_RETRIES):
@@ -86,14 +76,16 @@ def _single_stream(url, part_path, total, on_progress, timeout=_TIMEOUT, retries
 
 
 def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTIONS,
-                      timeout=_TIMEOUT, retries=_RETRIES):
-    """多连接分块下载到 dest（先写 dest.part 再原子替换）。
+                      timeout=_TIMEOUT, retries=_RETRIES, chunk_size=_CHUNK_SIZE):
+    """多线程「小块任务队列」下载到 dest（先写 dest.part 再原子替换）。
 
-    抗卡住设计：
-    - 先解析一次最终 URL，避免每个分块重复重定向/限流；
-    - 每个分块独立「断点续传 + 重试」：连接中断或读卡住（超过 timeout 无数据）后，
-      从已写位置继续，只要仍有进展就不消耗重试次数；连续无进展超过 retries 次才放弃；
-    - 不会因单个分块失败而把已下载内容全部作废重来。
+    抗慢尾 + 抗卡住设计：
+    - 文件切成多个固定大小小块放入队列，多个 worker 各自领取：快连接领得多、慢连接
+      领得少，结尾最多只剩一个小块在最慢连接上，避免单个慢连接拖垮整体收尾；
+    - 每个小块内部「断点续传 + 重试」：连接中断或读卡住（超过 timeout 无数据）后从已写
+      位置继续，只要有进展就不消耗重试次数，连续无进展超过 retries 次才放弃；
+    - 任一小块彻底失败则整体失败（清理 .part 后抛出），由调用方回退后端自带下载；
+    - 每个块各自请求原始 URL 由 urllib 重新重定向，不复用 HF 带签名的短时效 CDN 链接。
 
     on_progress(downloaded_bytes, total_bytes, speed_bytes_per_sec)。
     服务器不支持 Range 或大小未知时回退为单流下载。
@@ -101,17 +93,22 @@ def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTI
     part = dest + '.part'
     total, ranges_ok = _resolve(url, timeout=timeout)
 
-    if not (ranges_ok and total > _CHUNK * 2 and connections > 1):
+    if not (ranges_ok and total > chunk_size and connections > 1):
         _single_stream(url, part, total, on_progress, timeout=timeout, retries=retries)
         os.replace(part, dest)
         return dest
 
-    # 预分配文件，多线程各写一段（区间不重叠，分别打开句柄安全）
     with open(part, 'wb') as f:
         f.truncate(total)
 
+    tasks = queue.Queue()
+    for s in range(0, total, chunk_size):
+        tasks.put((s, min(s + chunk_size, total) - 1))
+
     lock = threading.Lock()
     state = {'done': 0, 't0': time.time()}
+    errors = []
+    stop = threading.Event()
 
     def report(delta):
         if not on_progress:
@@ -121,10 +118,10 @@ def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTI
             el = time.time() - state['t0']
             on_progress(state['done'], total, state['done'] / el if el > 0 else 0)
 
-    def worker(start, end):
+    def fetch_chunk(start, end):
         pos = start
         attempt = 0
-        while pos <= end:
+        while pos <= end and not stop.is_set():
             before = pos
             try:
                 req = urllib.request.Request(
@@ -138,29 +135,44 @@ def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTI
                         f.write(buf)
                         pos += len(buf)
                         report(len(buf))
+                        if stop.is_set():
+                            return False
             except Exception:
                 pass
             if pos > end:
-                return                      # 本分块完成
+                return True                  # 本块完成
             if pos > before:
-                attempt = 0                 # 有进展 → 重置重试计数，继续续传
+                attempt = 0                  # 有进展 → 重置重试
             else:
                 attempt += 1
                 if attempt > retries:
-                    raise IOError(f'分块 {start}-{end} 多次重试仍无进展')
+                    return False
                 time.sleep(min(2 * attempt, 8))
+        return pos > end
 
-    try:
-        with ThreadPoolExecutor(max_workers=connections) as ex:
-            futures = [ex.submit(worker, s, e) for s, e in _split(total, connections)]
-            for fu in futures:
-                fu.result()  # 任一分块彻底失败则抛出，由调用方回退到后端自带下载
-    except Exception:
+    def worker():
+        while not stop.is_set():
+            try:
+                start, end = tasks.get_nowait()
+            except queue.Empty:
+                return
+            if not fetch_chunk(start, end):
+                errors.append(IOError(f'分块 {start}-{end} 下载失败'))
+                stop.set()
+                return
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(connections)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if errors:
         try:
             os.remove(part)
         except OSError:
             pass
-        raise
+        raise errors[0]
 
     os.replace(part, dest)
     return dest
@@ -267,15 +279,16 @@ def ensure_whisper_model(whisper_name, on_progress=None, on_start=None,
 
 
 def ensure_mlx_model(repo_id, on_progress=None, on_start=None,
-                     connections=_DEFAULT_CONNECTIONS):
+                     connections=_DEFAULT_CONNECTIONS, endpoint=None):
     """确保指定 HF 仓库的文件已下到本地目录，返回该目录供 mlx_whisper 离线加载。
 
+    endpoint：HF 端点，传 'https://hf-mirror.com' 走国内镜像；None 为官方。
     任何失败应由调用方捕获并回退到传 repo id 让后端自行下载。
     """
     from huggingface_hub import HfApi, hf_hub_url
 
     target_dir = mlx_cache_dir(repo_id)
-    info = HfApi().model_info(repo_id, files_metadata=True)
+    info = HfApi(endpoint=endpoint).model_info(repo_id, files_metadata=True)
     sibs = [(s.rfilename, int(getattr(s, 'size', 0) or 0)) for s in info.siblings]
 
     def ok(fn, sz):
@@ -296,7 +309,7 @@ def ensure_mlx_model(repo_id, on_progress=None, on_start=None,
         if ok(fn, sz):
             base += sz
             continue
-        url = hf_hub_url(repo_id, fn)
+        url = hf_hub_url(repo_id, fn, endpoint=endpoint)
         b0 = base
 
         def cb(done, _t, speed, _b0=b0):

@@ -109,33 +109,49 @@ def setup_ffmpeg():
     """把随包的 ffmpeg 暴露为 PATH 中名为 `ffmpeg` 的可执行文件。
 
     imageio-ffmpeg 自带的二进制名形如 `ffmpeg-macos-arm64-vX`，而 whisper /
-    mlx_whisper 内部以 `ffmpeg` 调用子进程，故创建一个名为 ffmpeg 的软链/副本并
-    把其目录前置到 PATH。若随包二进制不可用，则回退到系统 PATH 中的 ffmpeg。
+    mlx_whisper 内部以 `ffmpeg` 调用子进程，故把它复制成一个名为 ffmpeg 的真实文件
+    放到稳定的缓存目录，并把该目录前置到 PATH。
+
+    用「复制」而非「软链」很关键：macOS 的 App Translocation 会让 .app 每次从不同
+    的随机临时路径运行，旧的软链会指向已消失的路径而失效，导致回退后 PATH 里只有名为
+    `ffmpeg-macos-...` 的二进制，whisper 以 `ffmpeg` 调用时报 “No such file”。复制出
+    的真实文件不受其影响；按大小判断复用，仅首次复制。
     """
     global _FFMPEG_PATH
+    src = None
     try:
         import imageio_ffmpeg
         src = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
+        src = None
+    if not src or not os.path.exists(src):
         _FFMPEG_PATH = shutil.which('ffmpeg')
+        if _FFMPEG_PATH:
+            os.environ['PATH'] = (os.path.dirname(_FFMPEG_PATH) + os.pathsep
+                                  + os.environ.get('PATH', ''))
         return _FFMPEG_PATH
 
-    bindir = os.path.join(tempfile.gettempdir(), 'srtgen_bin')
+    bindir = os.path.join(os.path.expanduser('~/.cache/srtgen'), 'bin')
     name = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
     target = os.path.join(bindir, name)
     try:
         os.makedirs(bindir, exist_ok=True)
-        if not os.path.exists(target):
-            try:
-                os.symlink(src, target)
-            except (OSError, NotImplementedError, AttributeError):
-                shutil.copy2(src, target)
-                os.chmod(target, 0o755)
+        reuse = (os.path.isfile(target) and not os.path.islink(target)
+                 and os.path.getsize(target) == os.path.getsize(src))
+        if not reuse:
+            if os.path.islink(target) or os.path.exists(target):
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+            shutil.copy2(src, target)
+            os.chmod(target, 0o755)
         _FFMPEG_PATH = target
+        os.environ['PATH'] = bindir + os.pathsep + os.environ.get('PATH', '')
     except Exception:
-        _FFMPEG_PATH = src  # 至少本程序可直接用该路径
-
-    os.environ['PATH'] = os.path.dirname(_FFMPEG_PATH) + os.pathsep + os.environ.get('PATH', '')
+        # 退路：直接用 imageio 二进制目录（名字可能不符，但聊胜于无）
+        _FFMPEG_PATH = src
+        os.environ['PATH'] = os.path.dirname(src) + os.pathsep + os.environ.get('PATH', '')
     return _FFMPEG_PATH
 
 
@@ -253,7 +269,7 @@ class Worker(QThread):
     progress_pct = pyqtSignal(int)       # 0..100，转录进度（可能不触发）
     started_task = pyqtSignal(str)       # downloading / loading / transcribing
 
-    def __init__(self, file_paths, model_size, device, language, task, export_itt):
+    def __init__(self, file_paths, model_size, device, language, task, export_itt, endpoint=None):
         super().__init__()
         self.file_paths = list(file_paths)
         self.model_size = model_size
@@ -261,6 +277,7 @@ class Worker(QThread):
         self.language = language        # None 表示自动检测
         self.task = task                # 'transcribe' / 'translate'
         self.export_itt = export_itt
+        self.endpoint = endpoint        # HF 下载端点（镜像）
 
     def _emit_pct(self, fraction):
         self.progress_pct.emit(int(fraction * 100))
@@ -289,7 +306,8 @@ class Worker(QThread):
                 local = downloader.ensure_mlx_model(
                     repo,
                     on_progress=self._on_download_progress,
-                    on_start=self._on_download_start)
+                    on_start=self._on_download_start,
+                    endpoint=self.endpoint)
                 if local:
                     repo = local
             except Exception:
@@ -399,9 +417,10 @@ class DownloadWorker(QThread):
     progress_pct = pyqtSignal(int)
     done = pyqtSignal(str)  # '' 成功，否则错误信息
 
-    def __init__(self, model_id):
+    def __init__(self, model_id, endpoint=None):
         super().__init__()
         self.model_id = model_id
+        self.endpoint = endpoint
         self._last_emit = 0.0
 
     def _on_progress(self, done, total, speed):
@@ -419,7 +438,8 @@ class DownloadWorker(QThread):
         try:
             if is_apple_silicon():
                 downloader.ensure_mlx_model(model_mlx_repo(self.model_id),
-                                            on_progress=self._on_progress)
+                                            on_progress=self._on_progress,
+                                            endpoint=self.endpoint)
             else:
                 if downloader.ensure_whisper_model(model_whisper_name(self.model_id),
                                                    on_progress=self._on_progress) is None:
@@ -571,6 +591,12 @@ class SubtitleGenerator(QMainWindow):
             self.device_selector.setEnabled(False)
         layout.addLayout(self._field_row('设备', self.device_selector))
 
+        # 下载源（镜像可大幅提升国内下载速度；只影响 Apple Silicon 的模型下载）
+        self.source_selector = QComboBox(self)
+        self.source_selector.addItem('国内镜像 hf-mirror.com（推荐）', 'https://hf-mirror.com')
+        self.source_selector.addItem('官方 HuggingFace', None)
+        layout.addLayout(self._field_row('下载源', self.source_selector))
+
         self.itt_checkbox = QCheckBox('同时导出 Apple .itt 字幕', self)
         layout.addWidget(self.itt_checkbox)
 
@@ -633,7 +659,8 @@ class SubtitleGenerator(QMainWindow):
         self.status_label.setText('准备下载...')
         self.current_task = 'downloading'
         self.start_timer()
-        self.dl_worker = DownloadWorker(self.model_selector.currentData())
+        self.dl_worker = DownloadWorker(self.model_selector.currentData(),
+                                        self.source_selector.currentData())
         self.dl_worker.progress.connect(self.update_progress)
         self.dl_worker.progress_pct.connect(self.update_pct)
         self.dl_worker.done.connect(self.on_predownload_done)
@@ -766,6 +793,7 @@ class SubtitleGenerator(QMainWindow):
             self.language_selector.currentData(),
             self.task_selector.currentData(),
             self.itt_checkbox.isChecked(),
+            self.source_selector.currentData(),
         )
         self.worker.result.connect(self.on_result)
         self.worker.progress.connect(self.update_progress)
@@ -848,6 +876,18 @@ def selftest():
     if not have_ffmpeg():
         ok = False
         print('[selftest] FAIL: ffmpeg 不可用')
+    # 关键：以子进程方式（依赖 PATH）调用 ffmpeg —— whisper/mlx_whisper 正是这样用的
+    try:
+        import subprocess
+        r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and 'ffmpeg version' in (r.stdout + r.stderr):
+            print('[selftest] ffmpeg 子进程(PATH)可执行 OK')
+        else:
+            ok = False
+            print(f'[selftest] FAIL: ffmpeg 子进程返回码 {r.returncode}')
+    except Exception as e:
+        ok = False
+        print(f'[selftest] FAIL: 无法以子进程方式调用 ffmpeg: {e!r}')
 
     try:
         missing = _check_backend_assets()
@@ -907,6 +947,27 @@ def selftest():
     return 0 if ok else 1
 
 
+def cli_transcribe(path, model_id='tiny'):
+    """命令行转录单个文件（复用 Worker，验证真实流程；用于测试 GUI 启动环境下 ffmpeg 是否可用）。"""
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    setup_ffmpeg()
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    holder = {}
+    device = 'mlx' if is_apple_silicon() else 'cpu'
+    w = Worker([path], model_id, device, None, 'transcribe', False)
+    w.result.connect(lambda r: holder.update(r=r))
+    w.progress.connect(lambda m: print('[progress]', m, flush=True))
+    w.finished.connect(app.quit)
+    w.start()
+    app.exec_()
+    r = holder.get('r')
+    if isinstance(r, list) and r and r[0][2] is None:
+        print('[OK] SRT:', r[0][1])
+        return 0
+    print('[FAIL]', r)
+    return 1
+
+
 def main():
     setup_ffmpeg()
     app = QApplication(sys.argv)
@@ -922,4 +983,7 @@ def main():
 if __name__ == '__main__':
     if '--selftest' in sys.argv:
         sys.exit(selftest())
+    if '--transcribe' in sys.argv:
+        _i = sys.argv.index('--transcribe')
+        sys.exit(cli_transcribe(sys.argv[_i + 1]))
     main()
