@@ -18,8 +18,8 @@ import time
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QPushButton,
-    QWidget, QComboBox, QProgressBar, QCheckBox,
+    QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QHBoxLayout,
+    QPushButton, QWidget, QComboBox, QProgressBar, QCheckBox, QFrame, QMessageBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon
@@ -58,15 +58,36 @@ LANGUAGES = [
     ('vi', '越南语'),
 ]
 
+# 模型注册表：id, 显示名, MLX 仓库(Apple Silicon), whisper 名(其余平台), 约大小(MB)
+# 注意 turbo 系列仓库名不遵循 whisper-{size}-mlx 规则，需在此显式映射。
 MODELS = [
-    ('large-v3', '大型 V3（最新，准确度最高）'),
-    ('large-v2', '大型 V2'),
-    ('large', '大型'),
-    ('medium', '中型'),
-    ('small', '小型'),
-    ('base', '基础'),
-    ('tiny', '最小'),
+    ('large-v3-turbo', '⚡ Large V3 Turbo（推荐 · 又快又准）',
+     'mlx-community/whisper-large-v3-turbo', 'large-v3-turbo', 1600),
+    ('large-v3', 'Large V3（最高准确度 · 较慢）',
+     'mlx-community/whisper-large-v3-mlx', 'large-v3', 3100),
+    ('medium', 'Medium（中型）',
+     'mlx-community/whisper-medium-mlx', 'medium', 1500),
+    ('small', 'Small（小型）',
+     'mlx-community/whisper-small-mlx', 'small', 480),
+    ('base', 'Base（基础）',
+     'mlx-community/whisper-base-mlx', 'base', 145),
+    ('tiny', 'Tiny（最快 · 准确度低）',
+     'mlx-community/whisper-tiny-mlx', 'tiny', 75),
 ]
+
+_MODEL_BY_ID = {m[0]: m for m in MODELS}
+
+
+def model_mlx_repo(model_id):
+    return _MODEL_BY_ID[model_id][2]
+
+
+def model_whisper_name(model_id):
+    return _MODEL_BY_ID[model_id][3]
+
+
+def model_approx_mb(model_id):
+    return _MODEL_BY_ID[model_id][4]
 
 
 def is_apple_silicon():
@@ -263,16 +284,16 @@ class Worker(QThread):
         """转录单个文件，返回 whisper 风格 result dict。"""
         if apple:
             # 多线程下载模型（带进度/速度），失败回退到传 repo id 让后端自行下载
-            repo = f'mlx-community/whisper-{self.model_size}-mlx'
+            repo = model_mlx_repo(self.model_size)
             try:
                 local = downloader.ensure_mlx_model(
-                    self.model_size,
+                    repo,
                     on_progress=self._on_download_progress,
                     on_start=self._on_download_start)
                 if local:
                     repo = local
             except Exception:
-                repo = f'mlx-community/whisper-{self.model_size}-mlx'
+                repo = model_mlx_repo(self.model_size)
             self.started_task.emit('transcribing')
             self.progress.emit('正在转录...')
             self.progress_pct.emit(0)
@@ -291,16 +312,17 @@ class Worker(QThread):
                 restore()
         else:
             if model_holder.get('model') is None:
+                wname = model_whisper_name(self.model_size)
                 try:
                     downloader.ensure_whisper_model(
-                        self.model_size,
+                        wname,
                         on_progress=self._on_download_progress,
                         on_start=self._on_download_start)
                 except Exception:
                     pass  # 回退到 whisper.load_model 自带下载
                 self.started_task.emit('loading')
                 self.progress.emit('正在加载模型...')
-                model_holder['model'] = _get_whisper_model(backend, self.model_size, self.device)
+                model_holder['model'] = _get_whisper_model(backend, wname, self.device)
             self.started_task.emit('transcribing')
             self.progress.emit('正在转录...')
             self.progress_pct.emit(0)
@@ -369,61 +391,176 @@ class Worker(QThread):
         self.result.emit(results)
 
 
+# ----------------------------- 预下载线程 -----------------------------
+
+class DownloadWorker(QThread):
+    """仅下载所选模型（不转录），用于「预下载」。"""
+    progress = pyqtSignal(str)
+    progress_pct = pyqtSignal(int)
+    done = pyqtSignal(str)  # '' 成功，否则错误信息
+
+    def __init__(self, model_id):
+        super().__init__()
+        self.model_id = model_id
+        self._last_emit = 0.0
+
+    def _on_progress(self, done, total, speed):
+        now = time.time()
+        if now - self._last_emit < 0.2 and total and done < total:
+            return
+        self._last_emit = now
+        mb = 1 << 20
+        pct = int(done / total * 100) if total else 0
+        self.progress_pct.emit(pct)
+        self.progress.emit(
+            f'下载中 {pct}% · {speed / mb:.1f} MB/s · {done // mb}/{(total or done) // mb} MB')
+
+    def run(self):
+        try:
+            if is_apple_silicon():
+                downloader.ensure_mlx_model(model_mlx_repo(self.model_id),
+                                            on_progress=self._on_progress)
+            else:
+                if downloader.ensure_whisper_model(model_whisper_name(self.model_id),
+                                                   on_progress=self._on_progress) is None:
+                    raise RuntimeError('未知模型')
+            self.done.emit('')
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(str(e))
+
+
 # ----------------------------- 主窗口 -----------------------------
+
+STYLESHEET = """
+QWidget { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+          font-size: 13px; color: #20232a; }
+#central { background: #f5f6fb; }
+#title { font-size: 17px; font-weight: 700; color: #4f46e5; }
+#dropArea { background: #ffffff; border: 2px dashed #c5c8e0; border-radius: 14px; }
+#dropArea[active="true"] { border-color: #7c3aed; background: #f4f1ff; }
+#dropLabel { color: #6b7280; }
+QLabel#fieldLabel { color: #4b5563; }
+QComboBox { padding: 6px 10px; border: 1px solid #d6d9e6; border-radius: 9px; background: #ffffff; }
+QComboBox:hover { border-color: #b3a8e8; }
+QComboBox:disabled { background: #eef0f6; color: #9aa0ad; }
+QPushButton { padding: 7px 12px; border: 1px solid #d6d9e6; border-radius: 9px; background: #ffffff; }
+QPushButton:hover { background: #f0eefc; border-color: #b3a8e8; }
+QPushButton:disabled { color: #b8bcc8; background: #f2f3f8; }
+QPushButton#primary { background: #6d28d9; color: #ffffff; border: none; font-weight: 600;
+                      font-size: 14px; padding: 11px; }
+QPushButton#primary:hover { background: #7c3aed; }
+QPushButton#primary:disabled { background: #c7bbf2; color: #ffffff; }
+QPushButton#ghost { border: none; color: #4f46e5; background: transparent; }
+QPushButton#ghost:hover { color: #7c3aed; background: transparent; }
+QPushButton#danger:enabled { color: #b91c1c; }
+QProgressBar { border: none; border-radius: 7px; background: #e7e8f2; height: 14px;
+               text-align: center; color: #20232a; }
+QProgressBar::chunk { background: #7c3aed; border-radius: 7px; }
+#cacheInfo { color: #6b7280; font-size: 12px; }
+#status { color: #4b5563; }
+#elapsed { color: #9aa0ad; font-size: 12px; }
+QCheckBox { spacing: 6px; }
+"""
+
+
+class DropArea(QFrame):
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('dropArea')
+        self.setMinimumHeight(120)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+
+
+def _fmt_size(n):
+    mb = n / (1 << 20)
+    return f'{mb / 1024:.1f} GB' if mb >= 1024 else f'{mb:.0f} MB'
+
 
 class SubtitleGenerator(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Whisper 字幕生成器')
-        self.setGeometry(200, 200, 460, 460)
+        self.setMinimumWidth(460)
         self.file_paths = []
         self.start_time = None
         self.current_task = None
         self.worker = None
+        self.dl_worker = None
+        self._busy = False
         self.initUI()
+        self.update_cache_status()
+
+    def _field_row(self, label_text, widget):
+        row = QHBoxLayout()
+        lab = QLabel(label_text)
+        lab.setObjectName('fieldLabel')
+        lab.setFixedWidth(48)
+        row.addWidget(lab)
+        row.addWidget(widget, 1)
+        return row
 
     def initUI(self):
         layout = QVBoxLayout()
-        layout.setSpacing(10)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
 
-        self.label = QLabel('拖拽音视频文件到此处，或点击下方按钮选择（支持多选）', self)
+        title = QLabel('Whisper 字幕生成器')
+        title.setObjectName('title')
+        layout.addWidget(title)
+
+        # 拖拽区（可点击）
+        self.drop_area = DropArea()
+        self.drop_area.clicked.connect(self.open_file_dialog)
+        da_layout = QVBoxLayout(self.drop_area)
+        da_layout.setContentsMargins(16, 16, 16, 16)
+        self.label = QLabel('拖拽音视频文件到此处\n或点击选择（支持多选）')
+        self.label.setObjectName('dropLabel')
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setWordWrap(True)
-        layout.addWidget(self.label)
+        da_layout.addWidget(self.label)
+        layout.addWidget(self.drop_area)
 
-        self.time_label = QLabel('', self)
-        self.time_label.setAlignment(Qt.AlignCenter)
-        self.time_label.setVisible(False)
-        layout.addWidget(self.time_label)
-
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        self.button = QPushButton('选择文件', self)
-        self.button.clicked.connect(self.open_file_dialog)
-        layout.addWidget(self.button)
-
-        layout.addWidget(QLabel('模型大小（越大越准但越慢）：'))
+        # 模型选择
         self.model_selector = QComboBox(self)
-        for model_id, desc in MODELS:
+        for model_id, desc, *_ in MODELS:
             self.model_selector.addItem(desc, model_id)
-        layout.addWidget(self.model_selector)
+        self.model_selector.currentIndexChanged.connect(self.update_cache_status)
+        layout.addLayout(self._field_row('模型', self.model_selector))
 
-        layout.addWidget(QLabel('语言：'))
+        # 模型缓存状态 + 预下载/删除
+        cache_row = QHBoxLayout()
+        cache_row.addSpacing(56)
+        self.cache_info = QLabel('')
+        self.cache_info.setObjectName('cacheInfo')
+        cache_row.addWidget(self.cache_info, 1)
+        self.predownload_btn = QPushButton('预下载')
+        self.predownload_btn.clicked.connect(self.predownload_model)
+        self.delete_btn = QPushButton('删除缓存')
+        self.delete_btn.setObjectName('danger')
+        self.delete_btn.clicked.connect(self.delete_model_cache)
+        cache_row.addWidget(self.predownload_btn)
+        cache_row.addWidget(self.delete_btn)
+        layout.addLayout(cache_row)
+
+        # 语言
         self.language_selector = QComboBox(self)
         for code, name in LANGUAGES:
             self.language_selector.addItem(name, code)
         self.language_selector.setCurrentIndex(1)  # 默认中文
-        layout.addWidget(self.language_selector)
+        layout.addLayout(self._field_row('语言', self.language_selector))
 
-        layout.addWidget(QLabel('任务：'))
+        # 任务
         self.task_selector = QComboBox(self)
         self.task_selector.addItem('转录（保留原语言）', 'transcribe')
         self.task_selector.addItem('翻译成英文', 'translate')
-        layout.addWidget(self.task_selector)
+        layout.addLayout(self._field_row('任务', self.task_selector))
 
-        layout.addWidget(QLabel('运行设备：'))
+        # 设备
         self.device_selector = QComboBox(self)
         if not is_apple_silicon():
             if self.check_cuda():
@@ -432,16 +569,36 @@ class SubtitleGenerator(QMainWindow):
         else:
             self.device_selector.addItem('MLX（Apple Silicon）', 'mlx')
             self.device_selector.setEnabled(False)
-        layout.addWidget(self.device_selector)
+        layout.addLayout(self._field_row('设备', self.device_selector))
 
         self.itt_checkbox = QCheckBox('同时导出 Apple .itt 字幕', self)
         layout.addWidget(self.itt_checkbox)
 
         self.generate_button = QPushButton('生成字幕', self)
+        self.generate_button.setObjectName('primary')
         self.generate_button.clicked.connect(self.generate_subtitle)
         layout.addWidget(self.generate_button)
 
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel('')
+        self.status_label.setObjectName('status')
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.time_label = QLabel('')
+        self.time_label.setObjectName('elapsed')
+        self.time_label.setAlignment(Qt.AlignCenter)
+        self.time_label.setVisible(False)
+        layout.addWidget(self.time_label)
+
+        layout.addStretch(1)
+
         container = QWidget()
+        container.setObjectName('central')
         container.setLayout(layout)
         self.setCentralWidget(container)
         self.setAcceptDrops(True)
@@ -449,6 +606,74 @@ class SubtitleGenerator(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_time)
         self.timer.setInterval(1000)
+
+    # --- 模型缓存管理 ---
+    def update_cache_status(self):
+        mid = self.model_selector.currentData()
+        if not mid:
+            return
+        try:
+            cached, size = downloader.model_cache_info(
+                is_apple_silicon(), model_mlx_repo(mid), model_whisper_name(mid))
+        except Exception:
+            cached, size = False, 0
+        if cached:
+            self.cache_info.setText(f'✓ 已缓存 · {_fmt_size(size)}')
+        else:
+            self.cache_info.setText(f'未下载 · 约 {model_approx_mb(mid)} MB')
+        self.predownload_btn.setEnabled(not cached and not self._busy)
+        self.delete_btn.setEnabled(cached and not self._busy)
+
+    def predownload_model(self):
+        if not have_ffmpeg():
+            pass  # 预下载不需要 ffmpeg
+        self._set_busy(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText('准备下载...')
+        self.current_task = 'downloading'
+        self.start_timer()
+        self.dl_worker = DownloadWorker(self.model_selector.currentData())
+        self.dl_worker.progress.connect(self.update_progress)
+        self.dl_worker.progress_pct.connect(self.update_pct)
+        self.dl_worker.done.connect(self.on_predownload_done)
+        self.dl_worker.start()
+
+    def on_predownload_done(self, err):
+        self.progress_bar.setVisible(False)
+        self.stop_timer()
+        self._set_busy(False)
+        if err:
+            self.status_label.setText(f'下载失败：{err}')
+        else:
+            self.status_label.setText('模型已下载完成 ✓')
+
+    def delete_model_cache(self):
+        mid = self.model_selector.currentData()
+        reply = QMessageBox.question(
+            self, '删除缓存',
+            f'确定删除「{_MODEL_BY_ID[mid][1]}」的本地缓存吗？\n（之后再次使用会重新下载）',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            freed = downloader.delete_model_cache(
+                is_apple_silicon(), model_mlx_repo(mid), model_whisper_name(mid))
+            self.status_label.setText(f'已删除缓存，释放 {_fmt_size(freed)}')
+        except Exception as e:
+            self.status_label.setText(f'删除失败：{e}')
+        self.update_cache_status()
+
+    def _set_busy(self, busy):
+        self._busy = busy
+        self.generate_button.setDisabled(busy)
+        self.model_selector.setDisabled(busy)
+        self.drop_area.setDisabled(busy)
+        if busy:
+            self.predownload_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+        else:
+            self.update_cache_status()
 
     # --- 计时 ---
     def start_timer(self):
@@ -467,13 +692,7 @@ class SubtitleGenerator(QMainWindow):
             return
         elapsed = int(time.time() - self.start_time)
         minutes, seconds = divmod(elapsed, 60)
-        messages = {
-            'downloading': f'正在下载模型... ({minutes}分{seconds}秒)',
-            'loading': f'正在加载模型... ({minutes}分{seconds}秒)',
-            'transcribing': f'正在转录... ({minutes}分{seconds}秒)',
-        }
-        if self.current_task in messages:
-            self.time_label.setText(messages[self.current_task])
+        self.time_label.setText(f'用时 {minutes}分{seconds}秒')
 
     def check_cuda(self):
         try:
@@ -483,21 +702,33 @@ class SubtitleGenerator(QMainWindow):
             return False
 
     # --- 文件选择 / 拖拽 ---
+    def _set_drop_active(self, on):
+        self.drop_area.setProperty('active', 'true' if on else 'false')
+        self.drop_area.style().unpolish(self.drop_area)
+        self.drop_area.style().polish(self.drop_area)
+
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
+        if event.mimeData().hasUrls() and not self._busy:
             event.accept()
+            self._set_drop_active(True)
         else:
             event.ignore()
 
+    def dragLeaveEvent(self, event):
+        self._set_drop_active(False)
+
     def dropEvent(self, event):
+        self._set_drop_active(False)
         all_paths = [u.toLocalFile() for u in event.mimeData().urls()]
         supported = [p for p in all_paths if Path(p).suffix.lower() in SUPPORTED_EXTENSIONS]
         if supported:
             self.set_files(supported)
         elif all_paths:
-            self.label.setText('拖入的文件格式不受支持，请拖入音频/视频文件')
+            self.label.setText('格式不支持，请拖入音频/视频文件')
 
     def open_file_dialog(self):
+        if self._busy:
+            return
         audio_filter = ' '.join(f'*{ext}' for ext in sorted(SUPPORTED_AUDIO_EXTENSIONS))
         video_filter = ' '.join(f'*{ext}' for ext in sorted(SUPPORTED_VIDEO_EXTENSIONS))
         names, _ = QFileDialog.getOpenFileNames(
@@ -511,21 +742,20 @@ class SubtitleGenerator(QMainWindow):
     def set_files(self, paths):
         self.file_paths = paths
         if len(paths) == 1:
-            self.label.setText(f'已选择文件: {os.path.basename(paths[0])}')
+            self.label.setText(f'已选择：{os.path.basename(paths[0])}')
         else:
             self.label.setText(f'已选择 {len(paths)} 个文件')
 
     # --- 生成 ---
     def generate_subtitle(self):
         if not self.file_paths:
-            self.label.setText('请先选择至少一个文件')
+            self.status_label.setText('请先选择至少一个文件')
             return
         if not have_ffmpeg():
-            self.label.setText('错误：未找到 ffmpeg，请重新安装应用或在系统中安装 ffmpeg。')
+            self.status_label.setText('错误：未找到 ffmpeg，请重新安装应用或在系统中安装 ffmpeg。')
             return
 
-        self.generate_button.setEnabled(False)
-        self.button.setEnabled(False)
+        self._set_busy(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # 先用忙碌态，收到进度后转确定态
 
@@ -543,7 +773,7 @@ class SubtitleGenerator(QMainWindow):
         self.worker.started_task.connect(self.on_task_started)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
-        self.label.setText('初始化中...')
+        self.status_label.setText('初始化中...')
 
     def on_task_started(self, task):
         self.current_task = task
@@ -555,7 +785,7 @@ class SubtitleGenerator(QMainWindow):
 
     def update_progress(self, message):
         if not message.startswith('错误'):
-            self.label.setText(message)
+            self.status_label.setText(message)
 
     def update_pct(self, pct):
         if self.progress_bar.maximum() == 0:
@@ -564,24 +794,23 @@ class SubtitleGenerator(QMainWindow):
 
     def on_result(self, payload):
         if isinstance(payload, str):  # 引擎级错误
-            self.label.setText(payload)
+            self.status_label.setText(payload)
             return
         ok = [r for r in payload if r[2] is None]
         failed = [r for r in payload if r[2] is not None]
         if len(payload) == 1 and ok:
-            self.label.setText(f'字幕已生成: {os.path.basename(ok[0][1])}')
+            self.status_label.setText(f'字幕已生成：{os.path.basename(ok[0][1])}')
         else:
             msg = f'完成：成功 {len(ok)} 个，失败 {len(failed)} 个'
             if failed:
                 first = failed[0]
-                msg += f'\n（{os.path.basename(first[0])}：{first[2]}）'
-            self.label.setText(msg)
+                msg += f'（{os.path.basename(first[0])}：{first[2]}）'
+            self.status_label.setText(msg)
 
     def on_worker_finished(self):
-        self.generate_button.setEnabled(True)
-        self.button.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.stop_timer()
+        self._set_busy(False)
 
 
 def _check_backend_assets():
@@ -681,6 +910,7 @@ def selftest():
 def main():
     setup_ffmpeg()
     app = QApplication(sys.argv)
+    app.setStyleSheet(STYLESHEET)
     icon_path = resource_path(os.path.join('assets', 'icon.png'))
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))

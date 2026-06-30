@@ -134,8 +134,8 @@ if IS_MAC:
             'NSHighResolutionCapable': True,
             'CFBundleName': 'SRT_gen',
             'CFBundleDisplayName': 'SRT 字幕生成器',
-            'CFBundleShortVersionString': '2.0.1',
-            'CFBundleVersion': '2.0.1',
+            'CFBundleShortVersionString': '2.1.0',
+            'CFBundleVersion': '2.1.0',
             'LSMinimumSystemVersion': '11.0',
         },
     )

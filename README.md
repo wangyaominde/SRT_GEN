@@ -7,7 +7,8 @@
 ## 主要功能
 
 - 拖拽或多选音视频文件（支持批量）：`mp3 / wav / m4a / flac / ogg / aac / opus / wma / aiff / amr / alac` 与 `mp4 / mkv / mov / m4v / avi / ts / webm / wmv / flv / mpeg / mpg`
-- 可选 Whisper 模型大小（`tiny` ~ `large-v3`）
+- 多种模型可选，默认 **Large V3 Turbo**（速度约为 large-v3 的数倍，质量接近，推荐）
+- 内置**模型管理**：预下载、显示缓存大小、一键删除缓存
 - **语言选择**（自动检测 / 中文 / 英语 / 日语…）与**任务选择**（转录 / 翻译成英文）
 - 运行设备选择（Apple Silicon 自动用 MLX；其余平台 CPU / CUDA）
 - 生成标准 `.srt`，并可选同时导出 Apple `.itt`

@@ -123,19 +123,96 @@ def parallel_download(url, dest, on_progress=None, connections=_DEFAULT_CONNECTI
     return dest
 
 
-def ensure_whisper_model(size, on_progress=None, on_start=None,
+def _whisper_root():
+    return os.path.expanduser('~/.cache/whisper')
+
+
+def _mlx_root():
+    return os.path.expanduser('~/.cache/srtgen_models')
+
+
+def _hf_hub_dir(repo_id):
+    name = 'models--' + repo_id.replace('/', '--')
+    return os.path.join(os.path.expanduser('~/.cache/huggingface/hub'), name)
+
+
+def mlx_cache_dir(repo_id):
+    return os.path.join(_mlx_root(), repo_id.split('/')[-1])
+
+
+def dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def whisper_cache_path(whisper_name):
+    """返回 whisper {name}.pt 的缓存路径；whisper 未安装/未知名返回 None。"""
+    try:
+        import whisper
+    except Exception:
+        return None
+    url = getattr(whisper, '_MODELS', {}).get(whisper_name)
+    if not url:
+        return None
+    return os.path.join(_whisper_root(), os.path.basename(url))
+
+
+def model_cache_info(apple, mlx_repo, whisper_name):
+    """返回 (是否已缓存, 字节数)。"""
+    if apple:
+        d = mlx_cache_dir(mlx_repo)
+        if os.path.isdir(d) and (os.path.exists(os.path.join(d, 'weights.npz'))
+                                 or os.path.exists(os.path.join(d, 'weights.safetensors'))):
+            return True, dir_size(d)
+        hub = _hf_hub_dir(mlx_repo)
+        if os.path.isdir(hub):
+            return True, dir_size(hub)
+        return False, 0
+    p = whisper_cache_path(whisper_name)
+    if p and os.path.exists(p):
+        return True, os.path.getsize(p)
+    return False, 0
+
+
+def delete_model_cache(apple, mlx_repo, whisper_name):
+    """删除模型缓存，返回释放的字节数。"""
+    import shutil
+    freed = 0
+    if apple:
+        for d in (mlx_cache_dir(mlx_repo), _hf_hub_dir(mlx_repo)):
+            if os.path.isdir(d):
+                freed += dir_size(d)
+                shutil.rmtree(d, ignore_errors=True)
+    else:
+        p = whisper_cache_path(whisper_name)
+        if p and os.path.exists(p):
+            freed += os.path.getsize(p)
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return freed
+
+
+def ensure_whisper_model(whisper_name, on_progress=None, on_start=None,
                          connections=_DEFAULT_CONNECTIONS):
-    """确保 openai-whisper 的 {size}.pt 已在 ~/.cache/whisper。
+    """确保 openai-whisper 的 {name}.pt 已在 ~/.cache/whisper。
 
     已存在则直接返回（由 whisper.load_model 负责 sha 校验/必要时重下）。
     返回 .pt 路径；无法处理（未知模型名）时返回 None 让后端自行下载。
     """
     import whisper
     models = getattr(whisper, '_MODELS', {})
-    if size not in models:
+    if whisper_name not in models:
         return None
-    url = models[size]
-    root = os.path.expanduser('~/.cache/whisper')
+    url = models[whisper_name]
+    root = _whisper_root()
     dest = os.path.join(root, os.path.basename(url))
     if os.path.exists(dest):
         return dest
@@ -146,20 +223,16 @@ def ensure_whisper_model(size, on_progress=None, on_start=None,
     return dest
 
 
-def ensure_mlx_model(size, on_progress=None, on_start=None,
+def ensure_mlx_model(repo_id, on_progress=None, on_start=None,
                      connections=_DEFAULT_CONNECTIONS):
-    """确保 mlx-community/whisper-{size}-mlx 仓库文件已下到本地目录。
+    """确保指定 HF 仓库的文件已下到本地目录，返回该目录供 mlx_whisper 离线加载。
 
-    返回本地目录路径（含 config.json + weights.npz 等），供 mlx_whisper
-    离线加载。任何失败应由调用方捕获并回退到传 repo id。
+    任何失败应由调用方捕获并回退到传 repo id 让后端自行下载。
     """
     from huggingface_hub import HfApi, hf_hub_url
 
-    repo = f'mlx-community/whisper-{size}-mlx'
-    target_dir = os.path.join(os.path.expanduser('~/.cache/srtgen_models'),
-                              f'whisper-{size}-mlx')
-
-    info = HfApi().model_info(repo, files_metadata=True)
+    target_dir = mlx_cache_dir(repo_id)
+    info = HfApi().model_info(repo_id, files_metadata=True)
     sibs = [(s.rfilename, int(getattr(s, 'size', 0) or 0)) for s in info.siblings]
 
     def ok(fn, sz):
@@ -180,7 +253,7 @@ def ensure_mlx_model(size, on_progress=None, on_start=None,
         if ok(fn, sz):
             base += sz
             continue
-        url = hf_hub_url(repo, fn)
+        url = hf_hub_url(repo_id, fn)
         b0 = base
 
         def cb(done, _t, speed, _b0=b0):
